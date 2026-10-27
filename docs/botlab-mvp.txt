@@ -1,0 +1,248 @@
+BotLab MVP — architektura i kontrakty funkcjonalne
+================================================
+Status: propozycja do ręcznego przeglądu właściciela, nie zgoda na wdrożenie.
+Zakres tego przyrostu: dokument, bez implementacji aplikacji.
+Repozytorium nie definiuje dotąd T01–T07. Poniżej zaproponowano ich znaczenie;
+akceptacja dokumentu ustala wspólną bazę dla implementacji i testów.
+
+1. Zakres i architektura
+-----------------------
+MVP to kontrolowane środowisko testowe dla botów: logowanie, lista projektów
+ekip budowlanych, zadania, formularz, zmiana statusu i obserwacja aktywności.
+Bez rejestracji, płatności, załączników, powiadomień, pracy offline i integracji
+z rzeczywistymi budowami. Wszystkie dane są syntetyczne.
+
+Flutter: jeden frontend dla przeglądarki oraz Android/iOS; wspólne modele,
+walidacja, routing i klient HTTP. Widoki dostosowane do telefonu i desktopu.
+FastAPI: wersjonowane REST /api/v1, uwierzytelnianie, autoryzacja, walidacja,
+transakcje i dziennik zdarzeń; OpenAPI jest źródłem kontraktu klienta.
+PostgreSQL: trwałe dane, migracje, klucze obce, ograniczenia i transakcje.
+Docker Compose: usługi web (statyczny build Flutter + reverse proxy /api),
+api oraz db z healthcheckami i nazwanym wolumenem. API startuje po gotowej bazie
+i migracjach. Baza nie ma publicznego portu; frontend nie łączy się z nią.
+Compose uruchamia środowisko web/API, nie emulator ani kompilację iOS.
+Aplikacja mobilna używa konfigurowalnego adresu tego samego API.
+Poza localhost wymagane HTTPS, jawna lista CORS i sekrety z konfiguracji
+środowiska, nigdy z repozytorium ani obrazu. Brak automatycznego wdrażania.
+
+Model minimalny:
+- User: id UUID, login unikalny, password_hash, role admin|bot, active.
+- Project: id UUID, name; BotProject: bot_id, project_id (dostęp do projektu).
+- Task: id UUID, project_id, title, description, status, version integer,
+  created_by, created_at, updated_at.
+- Activity: id UUID, actor_id, project_id opcjonalny, task_id opcjonalny,
+  action, before_status/after_status opcjonalne, occurred_at UTC, generation.
+- Session: hash nieprzezroczystego tokenu, user_id, expires_at, revoked_at.
+- Environment: generation integer zwiększana przy resecie.
+Indeksy: dostęp bota do projektów, zadania po projekcie, aktywność po czasie.
+Zapis zadania i Activity to jedna transakcja; błąd nie zostawia połowy operacji.
+
+2. Role, sesje i główne przepływy
+-------------------------------
+bot widzi tylko przypisane projekty i ich zadania, tworzy zadania i zmienia
+ich status. admin widzi wszystkie projekty i zadania, może wykonywać te same
+operacje, przegląda aktywność wszystkich botów i resetuje środowisko.
+MVP nie zawiera panelu zarządzania użytkownikami ani projektami — dostarcza je seed.
+Kontrola roli i zakresu danych jest po stronie API, także dla znanego UUID.
+Obiekt spoza zakresu bota daje 404, funkcja wyłącznie admina daje 403.
+
+Logowanie zwraca losowy token ważny przez 60 minut; hasła są hashowane Argon2id.
+Flutter web przechowuje token tylko w pamięci, mobile w magazynie systemowym.
+Nie zapisujemy tokenów w URL, localStorage, logach ani artefaktach testowych.
+Wylogowanie unieważnia sesję w API. 401 czyści sesję klienta i kieruje na login.
+Brak odświeżania tokenu w MVP; po wygaśnięciu wymagane ponowne logowanie.
+Logowanie ma limit prób i jednakowy komunikat dla błędnego loginu i hasła.
+
+Przepływ bota: login -> projekty -> zadania projektu -> nowe zadanie ->
+szczegóły -> zmiana statusu -> powrót/odświeżenie -> logout.
+Przepływ admina: login -> aktywność (odpytywanie co 5 s i ręczne odświeżenie)
+-> filtr po bocie/projekcie -> szczegóły zadania; osobno potwierdzany reset.
+Każdy ekran danych obsługuje ładowanie, pustą listę, błąd z ponowieniem oraz
+utratę sesji; brak podwójnego zapisu po wielokrotnym kliknięciu.
+
+3. T01–T07, ekrany i minimalne kryteria akceptacji
+------------------------------------------------
+ID tras i elementów są częścią kontraktu, nie zależą od tłumaczenia tekstów.
+
+T01 — Logowanie i wylogowanie; /login, wspólny pasek sesji.
+API: POST /auth/login, GET /auth/me, POST /auth/logout.
+AC: poprawne dane otwierają /projects i pokazują rolę; błędne dane wyświetlają
+ogólny błąd; pola wymagane; logout blokuje powrót do danych także przez API.
+ID: login.username, login.password, login.submit, login.error, session.logout.
+
+T02 — Wybór projektu; /projects.
+API: GET /projects.
+AC: bot widzi tylko przypisane projekty, admin wszystkie; wybór otwiera listę
+zadań właściwego projektu; stan pusty nie jest błędem.
+ID: projects.list, projects.item.<projectUUID>, projects.empty.
+
+T03 — Lista i filtrowanie zadań; /projects/:projectId/tasks.
+API: GET /projects/{project_id}/tasks ze statusem i paginacją.
+AC: pokazuje tytuł i status; filtr statusu resetuje offset; przejście do detalu
+i powrót zachowują filtr; odświeżenie pokazuje trwały stan z API.
+ID: tasks.list, tasks.status-filter, tasks.next, tasks.new, tasks.item.<taskUUID>.
+
+T04 — Formularz nowego zadania; /projects/:projectId/tasks/new.
+API: POST /projects/{project_id}/tasks.
+AC: tytuł po trim 1–120 znaków, opis 0–2000; błąd zachowuje wpisane dane;
+anulowanie nic nie zapisuje; sukces tworzy dokładnie jeden rekord i otwiera
+szczegóły w statusie todo; przy niepewnym wyniku ponowienie używa tego samego klucza.
+ID: task-form.title, task-form.description, task-form.submit,
+task-form.cancel, task-form.errors.
+
+T05 — Szczegóły i zmiana statusu; /tasks/:taskId.
+API: GET /tasks/{task_id}, PATCH /tasks/{task_id}/status.
+AC: widoczne tytuł/opis/status; tylko todo -> in_progress -> done, bez cofania;
+po zmianie i ponownym wejściu stan pozostaje; 409 wymusza odczyt nowej wersji,
+bez nadpisania cudzej zmiany; zmiana tworzy jedno zdarzenie Activity.
+ID: task.title, task.description, task.status, task.status-submit, task.conflict.
+
+T06 — Obserwacja przez admina; /admin/activity.
+API: GET /admin/activity; odnośnik do GET /tasks/{task_id}.
+AC: nowe udane logowanie, utworzenie zadania, zmiana statusu i logout pojawiają
+się z aktorem i czasem najpóźniej przy następnym udanym odpytywaniu (co 5 s);
+filtry po actor_id/project_id działają; bot nie ma dostępu także przez API.
+To dziennik operacji domenowych, nie nagrywanie ekranu ani każdego kliknięcia.
+ID: activity.list, activity.actor-filter, activity.project-filter,
+activity.refresh, activity.item.<activityUUID>.
+
+T07 — Reset przez admina; /admin/reset.
+API: POST /admin/reset.
+AC: wymagane potwierdzenie „RESET”; anulowanie nic nie zmienia; sukces odtwarza
+seed i zwiększa generation; sesje botów tracą ważność, sesja admina pozostaje;
+bot dostaje 403, drugie jednoczesne żądanie resetu 409.
+ID: reset.confirmation, reset.submit, reset.cancel, reset.result.
+
+Wspólne AC web/mobile: bez poziomego przewijania przy szerokości 360 px;
+formularze działają z klawiaturą ekranową; nawigacja wstecz nie ponawia POST.
+Flutter ValueKey i Semantics.identifier używają powyższych ID; web udostępnia
+je w drzewie semantycznym/DOM, mobile w drzewie dostępności testowanym przez
+wybrany runner. Widoczny tekst nie jest selektorem. Lista używa UUID, nie indeksu.
+Każda trasa ma screen.<nazwa>; odpowiednie stany używają state.loading,
+state.error, action.retry, a tylko listy state.empty w obrębie ekranu.
+Testy czekają na stan, nie na stały sleep.
+
+4. Minimalny kontrakt API (wszystkie ścieżki pod /api/v1)
+-------------------------------------------------------
+JSON, UUID jako string, daty ISO 8601 UTC. Chronione żądania: nagłówek
+Authorization zgodnie z token_type i access_token otrzymanymi przy logowaniu.
+Role i zakres według sekcji 2, bez ufania actor_id z klienta.
+Listy: {items: [...], total, limit, offset}; limit domyślnie 20, zakres 1–100,
+offset >= 0. Projekty sortowane po id, zadania po created_at,id rosnąco,
+aktywność po occurred_at,id malejąco. Filtry nie rozszerzają uprawnień.
+User = {id, login, role}; Project = {id, name}.
+Task = {id, project_id, title, description, status, version, created_by,
+created_at, updated_at}; Activity to pola modelu bez sekretów.
+
+Publiczne:
+- GET /health/live -> 200 {status:"ok"}; GET /health/ready -> 200 albo 503
+  {status:"ready"|"not_ready"}, sprawdza bazę i wersję migracji, bez szczegółów.
+- POST /auth/login {login, password} -> 200 {access_token, token_type:"bearer",
+  expires_in:3600, user:User, generation}; 401 błędne dane, 429 limit prób.
+
+admin i bot (w zakresie dostępu):
+- GET /auth/me -> 200 {user:User, generation}.
+- POST /auth/logout bez body -> 204, unieważnia bieżącą sesję.
+- GET /projects?limit=&offset= -> 200 lista Project.
+- GET /projects/{project_id}/tasks?status=&limit=&offset= -> 200 lista Task;
+  status opcjonalny: todo|in_progress|done.
+- POST /projects/{project_id}/tasks {title, description:""} -> 201 Task,
+  Location do szczegółów; status zawsze todo, version=1.
+- GET /tasks/{task_id} -> 200 Task.
+- PATCH /tasks/{task_id}/status {status, expected_version} -> 200 Task;
+  dozwolone przejścia z T05; sukces zwiększa version o 1, nieaktualna wersja
+  lub niedozwolone przejście -> 409. Brak dowolnej edycji/usuwania w MVP.
+
+Wyłącznie admin:
+- GET /admin/activity?actor_id=&project_id=&limit=&offset= -> 200 lista Activity;
+  filtry opcjonalne, łączone AND.
+- POST /admin/reset {confirmation:"RESET", expected_generation} -> 200
+  {generation, seed_version:"v1"} dopiero po zatwierdzeniu transakcji.
+  Stara generation -> 409, zła fraza -> 422, środowisko nietestowe -> 403.
+
+Błędy: {error:{code, message, fields:{pole:[komunikat]}, request_id}};
+fields może być puste. 401 brak/wygasła sesja, 403 rola, 404 brak/obcy zasób,
+409 konflikt, 422 walidacja, 429 limit, 503 chwilowa niedostępność/reset.
+Bez stack trace i danych uwierzytelniających. API normalizuje także błędy
+walidacji FastAPI do tego formatu; UI nie rozpoznaje błędów po tekście.
+POST tworzący zadanie wymaga Idempotency-Key UUID: ten sam użytkownik, klucz
+i body zwracają ten sam wynik 201 bez nowego zadania/zdarzenia; inne body
+z tym samym kluczem -> 409. Klucz i wynik zapisane atomowo, ważne do resetu.
+Mutacje zadań wymagają X-BotLab-Generation z /auth/me lub loginu; nieaktualna
+wartość -> 409 environment_changed. Przed ponowieniem klient odczytuje stan.
+OpenAPI i testy kontraktowe mają obejmować powyższe body, role i błędy.
+
+5. Seed, reset i izolacja testów
+------------------------------
+Seed v1: admin, bot-a i bot-b; projekty A i B; bot-a tylko A, bot-b tylko B.
+W A: trzy zadania (po jednym todo/in_progress/done), B: pusta lista.
+Jawny fixture ma stałe UUID użytkowników/projektów/zadań i stałe daty UTC;
+identyczne na web i mobile oraz po każdym resecie. Nowe obiekty dostają UUID
+z serwera. Scenariusze odwołują się do nazw fixture i UUID, nie kolejności listy.
+Hasła kont testowych pochodzą ze zmiennych środowiska; seed przerywa przy
+braku wartości, nie ma haseł domyślnych ani prawdziwych danych osobowych.
+Migracje przed seedem; jawne polecenie seed jest idempotentne i nie kasuje
+danych istniejącego środowiska. Zmiany danych wymagają oddzielnego resetu.
+
+Reset dostępny wyłącznie przy konfiguracji środowiska testowego, nigdy
+automatycznie przy starcie. Jedna transakcja i blokada środowiska obejmują
+odtworzenie fixture, usunięcie sesji botów, kluczy idempotencji i starej
+aktywności oraz zwiększenie generation; zapisuje nowe zdarzenie reset.
+Mutacje zadań i reset współdzielą blokadę, ponownie sprawdzają sesję/generation
+po jej uzyskaniu. Przy zajętej blokadzie resetu nowe mutacje zadań dostają 503,
+a drugi reset 409 reset_in_progress, bez kolejkowania. Odczyty widzą spójny
+stan sprzed lub po transakcji. Błąd resetu wycofuje całość. Zasoby o stałych
+UUID nie mogą zostać zmienione opóźnionym żądaniem sprzed resetu.
+T01–T07 uruchamiane sekwencyjnie od resetu, T06 sprawdza zdarzenia T01/T04/T05;
+T07 na końcu. Równoległe zestawy wymagają osobnych baz/instancji Compose.
+
+6. Pięć osób, małe zadania i kolejność wdrażania
+----------------------------------------------
+To kolejność implementacji, nie zgoda na deployment. Każdy punkt to osobny
+mały przyrost na przydzielonej gałęzi zadania; ten bot kontynuuje tylko obecną
+gałąź/PR. Nie rozpoczyna dalszych przyrostów przed przeglądem tego dokumentu.
+
+Osoba 1 — koordynacja/kontrakty: (a) przegląd i uzgodnienie tego dokumentu;
+(b) OpenAPI z przykładami błędów; AC: komplet endpointów i macierz ról,
+zgodne z testami kontraktowymi implementowanymi przez osobę 5.
+Osoba 2 — backend: (a) sesje i dostęp do projektów T01/T02;
+(b) lista/tworzenie T03/T04 z idempotencją; (c) wersjonowany status T05;
+AC: testy 401/403/404, walidacji, ponowień i równoczesnej zmiany wersji.
+Osoba 3 — dane/środowisko: (a) Compose, healthchecki i migracje;
+(b) seed v1 i reset T07; AC: świeża baza startuje według instrukcji,
+dwukrotny seed nie duplikuje danych, reset atomowy i odporny na wyścigi.
+Osoba 4 — Flutter: (a) login/nawigacja/projekty; (b) lista/formularz/detal;
+(c) aktywność/reset admina; AC: kryteria ekranów i identyfikatory T01–T07
+działają na web oraz telefonie, również dla błędów i wygasłej sesji.
+Osoba 5 — QA/obserwacja: (a) fixture i testy kontraktów/ról;
+(b) backend dziennika T06 z testami; (c) E2E T01–T07 i dowody;
+AC: zdarzenia zgodne z transakcjami, pełna ścieżka i izolacja ról udokumentowane.
+
+Kolejność/zależności:
+1) Właściciel przegląda dokument; osoby 1 i 5 ustalają kontrakty i przypadki.
+2) Osoba 3 dostarcza bazę/Compose/migracje/seed; osoba 1 OpenAPI.
+   Osoba 4 równolegle buduje szkielet ekranów na uzgodnionych mockach.
+3) Osoba 2 realizuje T01–T05 kolejno, osoba 4 integruje pionowe ścieżki;
+   osoba 5 weryfikuje każdą ścieżkę, nie dopiero gotową całość.
+4) Osoba 5 dostarcza T06, osoba 3 T07; osoba 4 integruje ekrany admina.
+5) Osoba 5 wykonuje pełne E2E na web i jednym zadeklarowanym telefonie;
+   właściciel dokonuje ręcznego przeglądu. Kolejna platforma wymaga osobnego
+   dowodu — wynik Android nie oznacza przetestowanego iOS.
+
+7. Bramka akceptacji i dowody
+-----------------------------
+Każdy przyrost: mały diff, testy adekwatne do zmiany i niezależny przegląd;
+autor nie zatwierdza własnego PR. Tylko właściciel zezwala na merge/deployment.
+PR musi wskazywać pełny SHA kodu oraz dla tego samego SHA: komendy i kody
+wyjścia, link do CI, seed_version/generation, platformę i wersję środowiska,
+wyniki T01–T07 oraz zanonimizowane zrzuty/trace z identyfikatorami UI.
+Obrazy API/web i build mobilny muszą wskazywać ten sam SHA. Zmiana SHA
+unieważnia wcześniejsze dowody; należy powtórzyć właściwe kontrole.
+Wymagane przyszłe testy: backend (role, walidacja, transakcje, konflikty,
+reset i idempotencja), Flutter (formularz, routing, stany), kontrakty i E2E.
+Nieudane testy blokują akceptację; brak uruchomienia opisujemy jako brak dowodu.
+
+Ten przyrost jest wyłącznie dokumentacyjny: repozytorium nie ma jeszcze
+runnera testów, builda ani lintera. Kontrola to przegląd zgodności T01–T07,
+ekranów, endpointów, ról i zależności oraz git diff --check; rzeczywiste
+wyniki i SHA zapisujemy w PR. Nie jest to dowód działania przyszłej aplikacji.
